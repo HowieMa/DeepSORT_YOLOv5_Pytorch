@@ -96,6 +96,10 @@ class VideoTracker(object):
             self.writer = cv2.VideoWriter(self.save_video_path, fourcc,
                                           self.vdo.get(cv2.CAP_PROP_FPS), (self.im_width, self.im_height))
             print('Done. Create output file ', self.save_video_path)
+
+        if self.args.save_txt:
+            os.makedirs(self.args.save_txt, exist_ok=True)
+
         return self
 
     def __exit__(self, exc_type, exc_value, exc_traceback):
@@ -105,12 +109,14 @@ class VideoTracker(object):
             print(exc_type, exc_value, exc_traceback)
 
     def run(self):
-        yolo_time, sort_time = [], []
+        yolo_time, sort_time, avg_fps = [], [], []
         t_start = time.time()
 
         idx_frame = 0
         last_out = None
         while self.vdo.grab():
+            # Inference *********************************************************************
+            t0 = time.time()
             _, img0 = self.vdo.retrieve()
 
             if idx_frame % self.args.frame_interval == 0:
@@ -121,12 +127,20 @@ class VideoTracker(object):
                 print('Frame %d Done. YOLO-time:(%.3fs) SORT-time:(%.3fs)' % (idx_frame, yt, st))
             else:
                 outputs = last_out  # directly use prediction in last frames
+            t1 = time.time()
+            avg_fps.append(t1 - t0)
 
+            # post-processing ***************************************************************
             # visualize bbox  ********************************
             if len(outputs) > 0:
                 bbox_xyxy = outputs[:, :4]
                 identities = outputs[:, -1]
                 img0 = draw_boxes(img0, bbox_xyxy, identities)  # BGR
+
+                # add FPS information on output video
+                text_scale = max(1, img0.shape[1] // 1600)
+                cv2.putText(img0, 'frame: %d fps: %.2f ' % (idx_frame, len(avg_fps) / sum(avg_fps)),
+                        (20, 20 + text_scale), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 0, 255), thickness=2)
 
             # display on window ******************************
             if self.args.display:
@@ -135,9 +149,17 @@ class VideoTracker(object):
                     cv2.destroyAllWindows()
                     break
 
-            # save to video **********************************
+            # save to video file *****************************
             if self.args.save_path:
                 self.writer.write(img0)
+
+            if self.args.save_txt:
+                with open(self.args.save_txt + str(idx_frame).zfill(4) + '.txt', 'a') as f:
+                    for i in range(len(outputs)):
+                        x1, y1, x2, y2, idx = outputs[i]
+                        f.write('{}\t{}\t{}\t{}\t{}\n'.format(x1, y1, x2, y2, idx))
+
+
 
             idx_frame += 1
 
@@ -207,9 +229,12 @@ if __name__ == '__main__':
     # input and output
     parser.add_argument('--input_path', type=str, default='input_480.mp4', help='source')  # file/folder, 0 for webcam
     parser.add_argument('--save_path', type=str, default='output/', help='output folder')  # output folder
-    parser.add_argument("--frame_interval", type=int, default=1)
+    parser.add_argument("--frame_interval", type=int, default=2)
+    parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
+    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--save_txt', default='output/predict/', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
 
-    # camera
+    # camera only
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--display_width", type=int, default=800)
     parser.add_argument("--display_height", type=int, default=600)
@@ -218,14 +243,11 @@ if __name__ == '__main__':
     # YOLO-V5 parameters
     parser.add_argument('--weights', type=str, default='yolov5/weights/yolov5s.pt', help='model.pt path')
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.4, help='object confidence threshold')
+    parser.add_argument('--conf-thres', type=float, default=0.5, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
     parser.add_argument('--classes', nargs='+', type=int, default=[0], help='filter by class')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
-    #
-    parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
 
     # deepsort parameters
     parser.add_argument("--config_deepsort", type=str, default="./configs/deep_sort.yaml")
