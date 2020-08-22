@@ -65,6 +65,7 @@ class Track:
 
     def __init__(self, mean, covariance, track_id, n_init, max_age,
                  feature=None):
+        #
         self.mean = mean
         self.covariance = covariance
         self.track_id = track_id
@@ -90,7 +91,7 @@ class Track:
             The bounding box.
 
         """
-        ret = self.mean[:4].copy()
+        ret = self.mean[:4].copy()  # xc,yc, a, h
         ret[2] *= ret[3]
         ret[:2] -= ret[2:] / 2
         return ret

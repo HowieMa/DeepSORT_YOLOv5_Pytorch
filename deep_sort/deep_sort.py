@@ -21,41 +21,52 @@ class DeepSort(object):
         max_cosine_distance = max_dist
         nn_budget = 100
         metric = NearestNeighborDistanceMetric("cosine", max_cosine_distance, nn_budget)
+
+        # tracker maintain a list contains(self.tracks) for each Track object
         self.tracker = Tracker(metric, max_iou_distance=max_iou_distance, max_age=max_age, n_init=n_init)
 
     def update(self, bbox_xywh, confidences, ori_img):
-        # bbox_xywh (#obj,4),
+        # bbox_xywh (#obj,4), [xc,yc, w, h]     bounding box for each person
         # conf (#obj,1)
 
         self.height, self.width = ori_img.shape[:2]
-        # generate detections
-        features = self._get_features(bbox_xywh, ori_img)   # appearance feature
 
-        bbox_tlwh = self._xywh_to_tlwh(bbox_xywh)
+        # get appearance feature with neural network (Deep) *********************************************************
+        features = self._get_features(bbox_xywh, ori_img)
+
+        bbox_tlwh = self._xywh_to_tlwh(bbox_xywh)   # # [cx,cy,w,h] -> [x1,y1,w,h]   top left
+
+        #  generate detections class object for each person *********************************************************
+        # filter object with less confidence
+        # each Detection obj maintain the location(bbox_tlwh), confidence(conf), and appearance feature
         detections = [Detection(bbox_tlwh[i], conf, features[i]) for i,conf in enumerate(confidences) if conf>self.min_confidence]
-        # detection obj
 
-        # run on non-maximum supression
+        # run on non-maximum supression (useless) *******************************************************************
         boxes = np.array([d.tlwh for d in detections])
         scores = np.array([d.confidence for d in detections])
-        indices = non_max_suppression(boxes, self.nms_max_overlap, scores)
+        indices = non_max_suppression(boxes, self.nms_max_overlap, scores)  # Here, nms_max_overlap is 1
         detections = [detections[i] for i in indices]
 
-        # update tracker
+        # update tracker ********************************************************************************************
         self.tracker.predict()      # predict based on t-1 info
+        # for first frame, this function do nothing
+
+        # detections is the measurement results as time T
         self.tracker.update(detections)
 
-        # output bbox identities
+        # output bbox identities ************************************************************************************
         outputs = []
         for track in self.tracker.tracks:
+
             if not track.is_confirmed() or track.time_since_update > 1:
                 continue
-            box = track.to_tlwh()
+
+            box = track.to_tlwh()       # (xc,yc,a,h) to (x1,y1,w,h)
             x1,y1,x2,y2 = self._tlwh_to_xyxy(box)
             track_id = track.track_id
             outputs.append(np.array([x1,y1,x2,y2,track_id], dtype=np.int))
         if len(outputs) > 0:
-            outputs = np.stack(outputs,axis=0)
+            outputs = np.stack(outputs,axis=0)  # (#obj, 5) (x1,y1,x2,y2,ID)
         return outputs
 
 
