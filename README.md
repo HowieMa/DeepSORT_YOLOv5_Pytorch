@@ -20,7 +20,7 @@ pip install -r requirements.txt
 
 4 Download the yolov5 weight. 
 I already put the `yolov5s.pt` inside. If you need other models, 
-please go to [here](https://drive.google.com/drive/folders/1Drs_Aiu7xx6S-ix95f9kNsA6ueKRpN2J). 
+please go to [official site of yolov5](https://github.com/ultralytics/yolov5). 
 and place the downlaoded `.pt` file under `yolov5/weights/`.   
 And I also aready downloaded the deepsort weights. 
 You can also download it from [here](https://drive.google.com/drive/folders/1xhG0kRH1EX5B9_Iz8gQJb7UNnn_riXi6), 
