@@ -1,3 +1,9 @@
+# weights
+weights/*
+
+# outputs
+output/*
+
 legacy/*
 .DS_Store
 debug/*
