@@ -7,9 +7,9 @@ from yolov5 import YOLOv5
 import matplotlib.pyplot as plt
 import matplotlib
 
-from utils_ds.parser import get_config
-from utils_ds.draw import draw_boxes
-from deep_sort import build_tracker
+from action_recognition.DeepSORT_yolov5.utils_ds.parser import get_config
+from action_recognition.DeepSORT_yolov5.utils_ds.draw import draw_boxes
+from action_recognition.DeepSORT_yolov5.deep_sort import build_tracker
 
 import argparse
 import os
@@ -19,6 +19,7 @@ import warnings
 import cv2
 import torch
 import torch.backends.cudnn as cudnn
+from random import randint
 
 import sys
 
@@ -34,9 +35,26 @@ def time_synchronized():
     torch.cuda.synchronize() if torch.cuda.is_available() else None
     return time.time()
 
+def augment_deepsort_bbox(bbox, frame_width, frame_height, width_ratio=1.5, height_ratio=1.2):
+    """
+    :param bbox: the bounding box with format of [x, y, width, height]
+    :param frame_width: the width of the frame that contains the bounding box
+    :param frame_height: the height of the frame that contians the bounding box
+    :param width_ratio: the augment ratio in width
+    :param height_ratio: the augment ratio in height
+    :return: an augmented bounding box with format of [x, y, width, height]
+    """
+    x_center = bbox[0] + bbox[2] / 2
+    y_center = bbox[1] + bbox[3] / 2
+    x_augmented = max(0, x_center - bbox[2] * width_ratio / 2)
+    y_augmented = max(0, y_center - bbox[3] * height_ratio / 2)
+    width_augmented = min(bbox[2] * width_ratio, frame_width - x_augmented)
+    height_augmented = min(bbox[3] * height_ratio, frame_height - y_augmented)
+    return np.array([x_augmented, y_augmented, width_augmented, height_augmented])
+
 
 class VideoTracker(object):
-    def __init__(self, args):
+    def __init__(self, args, yolo_detector):
         print('Initialize DeepSORT & YOLO-V5')
         # ***************** Initialize ******************************************************
         self.args = args
@@ -55,8 +73,10 @@ class VideoTracker(object):
         if args.cam != -1:
             print("Using webcam " + str(args.cam))
             self.vdo = cv2.VideoCapture(args.cam)
+            self.fps = self.vdo.get(cv2.CAP_PROP_FPS)
         else:
             self.vdo = cv2.VideoCapture()
+            self.fps = self.vdo.get(cv2.CAP_PROP_FPS)
 
         # ***************************** initialize DeepSORT **********************************
         cfg = get_config()
@@ -68,7 +88,8 @@ class VideoTracker(object):
         # ***************************** initialize YOLO-V5 **********************************
         # self.detector = torch.load(args.weights, map_location=self.device)['model'].float()  # load to FP32
         # self.detector = YOLOv5(args.weights, 'cuda')
-        self.detector = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+        # self.detector = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+        self.detector = yolo_detector
         self.detector.to(self.device).eval()
         # if self.half:
         #     self.detector.half()  # to FP16
@@ -126,10 +147,21 @@ class VideoTracker(object):
 
         idx_frame = 0
         last_out = None
+
+        videoFrames = []
+        playerBoxes = {}
+        colors = []
+        frame_width = 0
+        frame_height = 0
+
         while self.vdo.grab():
             # Inference *********************************************************************
             t0 = time.time()
             _, img0 = self.vdo.retrieve()
+
+            videoFrames.append(img0)
+            frame_height = img0.shape[0]
+            frame_width = img0.shape[1]
 
             if idx_frame % self.args.frame_interval == 0:
                 outputs, yt, st = self.image_track(img0)  # (#ID, 5) x1,y1,x2,y2,id
@@ -137,46 +169,33 @@ class VideoTracker(object):
                 yolo_time.append(yt)
                 sort_time.append(st)
                 print('Frame %d Done. YOLO-time:(%.3fs) SORT-time:(%.3fs)' % (idx_frame, yt, st))
+
+                for output in outputs:
+                    bbox = output[0:4]
+                    player_id = output[-1]
+
+                    if player_id not in playerBoxes:
+                        playerBoxes[player_id] = {}
+
+                    playerBoxes[player_id][idx_frame] = bbox
             else:
                 outputs = last_out  # directly use prediction in last frames
-            t1 = time.time()
-            avg_fps.append(t1 - t0)
-
-            # post-processing ***************************************************************
-            # visualize bbox  ********************************
-            if len(outputs) > 0:
-                bbox_xyxy = outputs[:, :4]
-                identities = outputs[:, -1]
-                img0 = draw_boxes(img0, bbox_xyxy, identities)  # BGR
-
-                # add FPS information on output video
-                text_scale = max(1, img0.shape[1] // 1600)
-                cv2.putText(img0, 'frame: %d fps: %.2f ' % (idx_frame, len(avg_fps) / sum(avg_fps)),
-                            (20, 20 + text_scale), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 0, 255), thickness=2)
-
-            # display on window ******************************
-            if self.args.display:
-                cv2.imshow("test", img0)
-                if cv2.waitKey(1) == ord('q'):  # q to quit
-                    cv2.destroyAllWindows()
-                    break
-
-            # save to video file *****************************
-            if self.args.save_path:
-                self.writer.write(img0)
-
-            if self.args.save_txt:
-                with open(self.args.save_txt + str(idx_frame).zfill(4) + '.txt', 'a') as f:
-                    for i in range(len(outputs)):
-                        x1, y1, x2, y2, idx = outputs[i]
-                        f.write('{}\t{}\t{}\t{}\t{}\n'.format(x1, y1, x2, y2, idx))
 
             idx_frame += 1
 
-        print('Avg YOLO time (%.3fs), Sort time (%.3fs) per frame' % (sum(yolo_time) / len(yolo_time),
-                                                                      sum(sort_time) / len(sort_time)))
-        t_end = time.time()
-        print('Total time (%.3fs), Total Frame: %d' % (t_end - t_start, idx_frame))
+        # print('Avg YOLO time (%.3fs), Sort time (%.3fs) per frame' % (sum(yolo_time) / len(yolo_time),
+        #                                                               sum(sort_time) / len(sort_time)))
+        # t_end = time.time()
+        # print('Total time (%.3fs), Total Frame: %d' % (t_end - t_start, idx_frame))
+
+        playerBoxes_list = transform_playerBoxes_to_list(videoFrames, playerBoxes)
+
+        if len(playerBoxes_list) != 0:
+            num_of_players = playerBoxes_list[0].shape[0]
+            for i in range(num_of_players):
+                colors.append((randint(0, 255), randint(0, 255), randint(0, 255)))
+        # self.fps = 30
+        return videoFrames, playerBoxes_list, frame_width, frame_height, colors, self.fps
 
     def image_track(self, im0):
         """
@@ -237,13 +256,44 @@ class VideoTracker(object):
         t3 = time.time()
         return outputs, t2 - t1, t3 - t2
 
+def transform_playerBoxes_to_list(videoFrames, playerBoxes):
+    """
+    :param videoFrames: The list of video frames
+    :param playerBoxes: The dictionary of player's bbox.
+    :return: A playerBoxes list that contains bbox for every frame
+    """
+    list_of_bbox = []
+    player_ids = list(playerBoxes.keys())
+    print("player ids: {}".format(player_ids))
+
+    for i in range(len(videoFrames)):
+        bboxes = [] # The bounding boxes for all players at the current frame
+        for id in player_ids:
+            bbox_dict = playerBoxes[id] # The dictionary with key to be frame idx, and value to be the bbox for the player at the frame
+            if i not in bbox_dict:
+                bboxes.append([0, 0, 0, 0])
+            else:
+                bbox = list(bbox_dict[i])
+                # Do an initial bbox augment so that the top right point is unchanged but the
+                # width and height of the bbox is augmented.
+                bbox = [bbox[0], bbox[1], 1.5 * (bbox[2]-bbox[0]), 1.1 * (bbox[3]-bbox[1])]
+                # Do a second bbox augmentation so that the center of the bbox is unchanged, but the
+                # width and height of the bbox is augmented.
+                # These 2 augmentations are simply engineering tuning to make the shot detector to be
+                # more accurate.
+                bbox = augment_deepsort_bbox(bbox, videoFrames[i].shape[1], videoFrames[i].shape[0])
+                bboxes.append(list(bbox))
+        list_of_bbox.append(np.array(bboxes))
+
+    return list_of_bbox
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # input and output
-    parser.add_argument('--input_path', type=str, default='mot_test4.mov', help='source')  # file/folder, 0 for webcam
+    parser.add_argument('--input_path', type=str, default='../../videos/test2.mp4', help='source')  # file/folder, 0 for webcam
     parser.add_argument('--save_path', type=str, default='output/', help='output folder')  # output folder
-    parser.add_argument("--frame_interval", type=int, default=2)
+    parser.add_argument("--frame_interval", type=int, default=1)
     parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--save_txt', default='output/predict/', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
@@ -269,6 +319,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.img_size = check_img_size(args.img_size)
     print(args)
+    yolo_detector = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
 
-    with VideoTracker(args) as vdo_trk:
-        vdo_trk.run()
+    with VideoTracker(args,yolo_detector) as vdo_trk:
+        frames, playerBoxes, _, _, colors, fps = vdo_trk.run()
+        print("frames size: {}".format(len(frames)))
+        print("colors: {}, fps: {}".format(colors, fps))
+        print("playerBoxes list len: {}, boxes list: {}".format(len(playerBoxes), playerBoxes))
