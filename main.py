@@ -12,6 +12,8 @@ import os
 import time
 import numpy as np
 import warnings
+from collections import defaultdict
+
 import cv2
 import torch
 import torch.backends.cudnn as cudnn
@@ -20,18 +22,84 @@ import sys
 
 currentUrl = os.path.dirname(__file__)
 sys.path.append(os.path.abspath(os.path.join(currentUrl, 'yolov5')))
-
-
 cudnn.benchmark = True
+
+delta = np.array([])
+idx_arr = np.array([])
+
+
+def calcDe(buffer, idx_frame):
+
+    # Initialize prevData as a 2D NumPy array
+    prev_data = np.zeros((1000, 3), dtype=int)
+    global delta
+    global idx_arr
+
+    # Process every 10 frames
+    if idx_frame > 0:
+        # Calculate the desired values for each idx
+        for idx, positions in buffer.items():
+            idx_arr = np.append(idx_arr, idx)
+            if positions:
+                x1, y1, x2, y2 = np.mean(positions, axis=0)[:4]
+                midpoint_x, midpoint_y = (x1 + x2) // 2, (y1 + y2) // 2
+
+                # Calculate displacement and difference between frames
+                delta_x, delta_y, delta_x2 = 0.0, 0.0, 0.0
+                delta_frame = -1
+
+                if prev_data[idx % 10][0] is not None:
+                    delta_x = midpoint_x - prev_data[idx % 10][0]
+                    delta_y = midpoint_y - prev_data[idx % 10][1]
+                    delta_frame = idx_frame - prev_data[idx % 10][2]
+
+                    # If there is no displacement, ignore and continue
+                    if delta_x == 0 and delta_y == 0:
+                        continue
+
+                    if delta_frame == 0:
+                        break
+
+                    # Calculate mean displacement
+                    delta_x /= delta_frame
+                    delta_y /= delta_frame
+                    delta_x2 = delta_x * 64 / (x2 - x1)
+
+                    # Update previous data
+                    prev_data[idx % 10] = [midpoint_x, midpoint_y, idx_frame]
+
+                    delta = np.append(delta, delta_x2)
+
+        if idx_frame % 10 == 0:
+            # Define each interval (bin)
+            bins = [-float('inf'), -30, -26, -22, -18, -14, -10,
+                    -6, -2, 2, 6, 10, 14, 18, 22, 26, 30, float('inf')]
+
+            # Number of values in each interval
+            res, _ = np.histogram(delta, bins)
+            unique_idx, _ = np.unique(idx_arr, return_counts=True)
+
+            # Create Results
+            idCount = len(unique_idx)
+            res = np.append(res, idCount)
+
+            delta = np.array([])
+            idx_arr = np.array([])
+
+            return res
+        else:
+            return np.array([])
 
 
 class VideoTracker(object):
+
     def __init__(self, args):
         print('Initialize DeepSORT & YOLO-V5')
         # ***************** Initialize ******************************************************
         self.args = args
 
-        self.img_size = args.img_size                   # image size in detector, default is 640
+        # image size in detector, default is 640
+        self.img_size = args.img_size
         self.frame_interval = args.frame_interval       # frequency
 
         self.device = select_device(args.device)
@@ -56,16 +124,19 @@ class VideoTracker(object):
         self.deepsort = build_tracker(cfg, use_cuda=use_cuda)
 
         # ***************************** initialize YOLO-V5 **********************************
-        self.detector = torch.load(args.weights, map_location=self.device)['model'].float()  # load to FP32
+        self.detector = torch.load(args.weights, map_location=self.device)[
+            'model'].float()  # load to FP32
         self.detector.to(self.device).eval()
         if self.half:
             self.detector.half()  # to FP16
 
-        self.names = self.detector.module.names if hasattr(self.detector, 'module') else self.detector.names
+        self.names = self.detector.module.names if hasattr(
+            self.detector, 'module') else self.detector.names
 
         print('Done..')
         if self.device == 'cpu':
-            warnings.warn("Running in cpu mode which maybe very slow!", UserWarning)
+            warnings.warn(
+                "Running in cpu mode which maybe very slow!", UserWarning)
 
     def __enter__(self):
         # ************************* Load video from camera *************************
@@ -86,25 +157,26 @@ class VideoTracker(object):
             print('Done. Load video file ', self.args.input_path)
 
         # ************************* create output *************************
-        if self.args.save_path:
-            os.makedirs(self.args.save_path, exist_ok=True)
-            # path of saved video and results
-            self.save_video_path = os.path.join(self.args.save_path, "results.mp4")
+        # if self.args.save_path:
+        #     os.makedirs(self.args.save_path, exist_ok=True)
+        #     # path of saved video and results
+        #     self.save_video_path = os.path.join(
+        #         self.args.save_path, "results.mp4")
 
-            # create video writer
-            fourcc = cv2.VideoWriter_fourcc(*self.args.fourcc)
-            self.writer = cv2.VideoWriter(self.save_video_path, fourcc,
-                                          self.vdo.get(cv2.CAP_PROP_FPS), (self.im_width, self.im_height))
-            print('Done. Create output file ', self.save_video_path)
+        #     # create video writer
+        #     fourcc = cv2.VideoWriter_fourcc(*self.args.fourcc)
+        #     self.writer = cv2.VideoWriter(self.save_video_path, fourcc,
+        #                                   self.vdo.get(cv2.CAP_PROP_FPS), (self.im_width, self.im_height))
+        #     print('Done. Create output file ', self.save_video_path)
 
-        if self.args.save_txt:
-            os.makedirs(self.args.save_txt, exist_ok=True)
+        # if self.args.save_txt:
+        #     os.makedirs(self.args.save_txt, exist_ok=True)
 
         return self
 
     def __exit__(self, exc_type, exc_value, exc_traceback):
-        self.vdo.release()
-        self.writer.release()
+        # self.vdo.release()
+        # self.writer.release()
         if exc_type:
             print(exc_type, exc_value, exc_traceback)
 
@@ -112,6 +184,7 @@ class VideoTracker(object):
         yolo_time, sort_time, avg_fps = [], [], []
         t_start = time.time()
 
+        buffer = defaultdict(list)
         idx_frame = 0
         last_out = None
         while self.vdo.grab():
@@ -120,11 +193,12 @@ class VideoTracker(object):
             _, img0 = self.vdo.retrieve()
 
             if idx_frame % self.args.frame_interval == 0:
-                outputs, yt, st = self.image_track(img0)        # (#ID, 5) x1,y1,x2,y2,id
+                outputs, yt, st = self.image_track(
+                    img0)        # (#ID, 5) x1,y1,x2,y2,id
                 last_out = outputs
                 yolo_time.append(yt)
                 sort_time.append(st)
-                print('Frame %d Done. YOLO-time:(%.3fs) SORT-time:(%.3fs)' % (idx_frame, yt, st))
+                # print('Frame %d Done. YOLO-time:(%.3fs) SORT-time:(%.3fs)' % (idx_frame, yt, st))
             else:
                 outputs = last_out  # directly use prediction in last frames
             t1 = time.time()
@@ -132,41 +206,31 @@ class VideoTracker(object):
 
             # post-processing ***************************************************************
             # visualize bbox  ********************************
+            # Save results to buffer
+
             if len(outputs) > 0:
-                bbox_xyxy = outputs[:, :4]
-                identities = outputs[:, -1]
-                img0 = draw_boxes(img0, bbox_xyxy, identities)  # BGR
+                for output in outputs:
+                    idx = int(output[-1])
+                    # Append x1, y1, x2, y2 to the buffer
+                    buffer[idx].append(output[:4])
 
-                # add FPS information on output video
-                text_scale = max(1, img0.shape[1] // 1600)
-                cv2.putText(img0, 'frame: %d fps: %.2f ' % (idx_frame, len(avg_fps) / sum(avg_fps)),
-                        (20, 20 + text_scale), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 0, 255), thickness=2)
+                if idx_frame % 2 == 0:
+                    res = calcDe(buffer, idx_frame)
+                    if len(res) > 0:
+                        for i in res:
+                            print(i, end=" ")
+                        print()
 
-            # display on window ******************************
-            if self.args.display:
-                cv2.imshow("test", img0)
-                if cv2.waitKey(1) == ord('q'):  # q to quit
-                    cv2.destroyAllWindows()
-                    break
-
-            # save to video file *****************************
-            if self.args.save_path:
-                self.writer.write(img0)
-
-            if self.args.save_txt:
-                with open(self.args.save_txt + str(idx_frame).zfill(4) + '.txt', 'a') as f:
-                    for i in range(len(outputs)):
-                        x1, y1, x2, y2, idx = outputs[i]
-                        f.write('{}\t{}\t{}\t{}\t{}\n'.format(x1, y1, x2, y2, idx))
-
-
+                # Clear buffer after processing
+                buffer.clear()
 
             idx_frame += 1
 
         print('Avg YOLO time (%.3fs), Sort time (%.3fs) per frame' % (sum(yolo_time) / len(yolo_time),
-                                                            sum(sort_time)/len(sort_time)))
+                                                                      sum(sort_time)/len(sort_time)))
         t_end = time.time()
-        print('Total time (%.3fs), Total Frame: %d' % (t_end - t_start, idx_frame))
+        print('Total time (%.3fs), Total Frame: %d' %
+              (t_end - t_start, idx_frame))
 
     def image_track(self, im0):
         """
@@ -192,7 +256,8 @@ class VideoTracker(object):
         # Inference
         t1 = time_synchronized()
         with torch.no_grad():
-            pred = self.detector(img, augment=self.args.augment)[0]  # list: bz * [ (#obj, 6)]
+            pred = self.detector(img, augment=self.args.augment)[
+                0]  # list: bz * [ (#obj, 6)]
 
         # Apply NMS and filter object other than person (cls:0)
         pred = non_max_suppression(pred, self.args.conf_thres, self.args.iou_thres,
@@ -201,10 +266,12 @@ class VideoTracker(object):
 
         # get all obj ************************************************************
         det = pred[0]  # for video, bz is 1
-        if det is not None and len(det):  # det: (#obj, 6)  x1 y1 x2 y2 conf cls
+        # det: (#obj, 6)  x1 y1 x2 y2 conf cls
+        if det is not None and len(det):
 
             # Rescale boxes from img_size to original im0 size
-            det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+            det[:, :4] = scale_coords(
+                img.shape[2:], det[:, :4], im0.shape).round()
 
             # Print results. statistics of number of each obj
             for c in det[:, -1].unique():
@@ -227,30 +294,45 @@ class VideoTracker(object):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # input and output
-    parser.add_argument('--input_path', type=str, default='input_480.mp4', help='source')  # file/folder, 0 for webcam
-    parser.add_argument('--save_path', type=str, default='output/', help='output folder')  # output folder
+    # file/folder, 0 for webcam
+    parser.add_argument('--input_path', type=str,
+                        default='input_480.mp4', help='source')
+    parser.add_argument('--save_path', type=str, default='output/',
+                        help='output folder')  # output folder
     parser.add_argument("--frame_interval", type=int, default=2)
-    parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--save_txt', default='output/predict/', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--fourcc', type=str, default='mp4v',
+                        help='output video codec (verify ffmpeg support)')
+    parser.add_argument('--device', default='',
+                        help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--save_txt', default='output/predict/',
+                        help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
 
     # camera only
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--display_width", type=int, default=800)
     parser.add_argument("--display_height", type=int, default=600)
-    parser.add_argument("--camera", action="store", dest="cam", type=int, default="-1")
+    parser.add_argument("--camera", action="store",
+                        dest="cam", type=int, default="-1")
 
     # YOLO-V5 parameters
-    parser.add_argument('--weights', type=str, default='yolov5/weights/yolov5s.pt', help='model.pt path')
-    parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.5, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
-    parser.add_argument('--classes', nargs='+', type=int, default=[0], help='filter by class')
-    parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
-    parser.add_argument('--augment', action='store_true', help='augmented inference')
+    parser.add_argument('--weights', type=str,
+                        default='yolov5/weights/yolov5s.pt', help='model.pt path')
+    parser.add_argument('--img-size', type=int, default=640,
+                        help='inference size (pixels)')
+    parser.add_argument('--conf-thres', type=float,
+                        default=0.5, help='object confidence threshold')
+    parser.add_argument('--iou-thres', type=float,
+                        default=0.5, help='IOU threshold for NMS')
+    parser.add_argument('--classes', nargs='+', type=int,
+                        default=[0], help='filter by class')
+    parser.add_argument('--agnostic-nms', action='store_true',
+                        help='class-agnostic NMS')
+    parser.add_argument('--augment', action='store_true',
+                        help='augmented inference')
 
     # deepsort parameters
-    parser.add_argument("--config_deepsort", type=str, default="./configs/deep_sort.yaml")
+    parser.add_argument("--config_deepsort", type=str,
+                        default="./configs/deep_sort.yaml")
 
     args = parser.parse_args()
     args.img_size = check_img_size(args.img_size)
@@ -258,4 +340,3 @@ if __name__ == '__main__':
 
     with VideoTracker(args) as vdo_trk:
         vdo_trk.run()
-
